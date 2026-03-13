@@ -1,0 +1,314 @@
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use anyhow::Result;
+use walkdir::WalkDir;
+
+use crate::config_model::{EffectiveConfig, ThemeEntry};
+use crate::parser::resolve_include;
+
+pub fn discover_themes(dir: Option<&Path>) -> Result<Vec<ThemeEntry>> {
+    let Some(root) = dir else {
+        return Ok(vec![]);
+    };
+    let mut themes = Vec::new();
+    for scan_root in theme_search_roots(root) {
+        for entry in WalkDir::new(scan_root).min_depth(1).max_depth(5) {
+            let entry = entry?;
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            let path = entry.path();
+            let sample = preview_lines(path, 40).unwrap_or_default();
+            if !is_theme_candidate(path, &sample) {
+                continue;
+            }
+            let preview = sample.into_iter().take(12).collect();
+            let name = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("theme")
+                .to_string();
+            themes.push(ThemeEntry {
+                name,
+                path: path.to_path_buf(),
+                preview,
+            });
+        }
+    }
+    themes.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(themes)
+}
+
+fn theme_search_roots(root: &Path) -> Vec<PathBuf> {
+    let mut scan_roots = Vec::new();
+    for name in ["themes", "theme", "colors"] {
+        let candidate = root.join(name);
+        if candidate.is_dir() {
+            scan_roots.push(candidate);
+        }
+    }
+    if scan_roots.is_empty() {
+        vec![root.to_path_buf()]
+    } else {
+        scan_roots
+    }
+}
+
+fn preview_lines(path: &Path, limit: usize) -> Result<Vec<String>> {
+    let text = fs::read_to_string(path)?;
+    Ok(text.lines().take(limit).map(|s| s.to_string()).collect())
+}
+
+fn is_theme_candidate(path: &Path, sample: &[String]) -> bool {
+    let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
+    if !(ext == "conf" || ext == "theme") {
+        return false;
+    }
+
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    if file_name.eq_ignore_ascii_case("kitty.conf") || is_theme_wrapper_path(file_name) {
+        return false;
+    }
+
+    looks_like_theme_preview(sample)
+}
+
+fn looks_like_theme_preview(lines: &[String]) -> bool {
+    let mut matches = 0usize;
+    for line in lines {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+
+        let Some(key) = trimmed.split_whitespace().next() else {
+            continue;
+        };
+        if is_theme_setting_key(key) {
+            matches += 1;
+            if matches >= 2 {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+pub fn is_theme_setting_key(key: &str) -> bool {
+    key.strip_prefix("color")
+        .is_some_and(|suffix| !suffix.is_empty() && suffix.chars().all(|ch| ch.is_ascii_digit()))
+        || matches!(
+            key,
+            "foreground"
+                | "background"
+                | "selection_foreground"
+                | "selection_background"
+                | "cursor"
+                | "cursor_text_color"
+                | "url_color"
+                | "active_border_color"
+                | "inactive_border_color"
+                | "bell_border_color"
+                | "active_tab_foreground"
+                | "active_tab_background"
+                | "inactive_tab_foreground"
+                | "inactive_tab_background"
+                | "tab_bar_background"
+                | "mark1_foreground"
+                | "mark1_background"
+                | "mark2_foreground"
+                | "mark2_background"
+                | "mark3_foreground"
+                | "mark3_background"
+        )
+}
+
+pub fn theme_artifact_path(main_file: &Path) -> PathBuf {
+    main_file
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("current-theme.conf")
+}
+
+pub fn detect_current_theme_include(effective: &EffectiveConfig) -> Option<String> {
+    effective
+        .includes
+        .iter()
+        .rev()
+        .find(|include| is_theme_include(&include.path))
+        .map(|line| line.path.clone())
+}
+
+pub fn is_theme_include(path: &str) -> bool {
+    let lower = path.to_lowercase();
+    lower.contains("theme")
+        || lower.contains("themes/")
+        || lower.contains("colors/")
+        || lower.ends_with("colors.conf")
+        || lower.contains("color-theme")
+        || lower.ends_with(".theme")
+}
+
+pub fn is_theme_wrapper_path(path: &str) -> bool {
+    let filename = Path::new(path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    matches!(
+        filename.as_str(),
+        "current-theme.conf" | "colors.conf" | "theme.conf"
+    )
+}
+
+pub fn find_current_theme_index(
+    themes: &[ThemeEntry],
+    effective: &EffectiveConfig,
+    current_include: Option<&str>,
+    current_theme_artifact: &Path,
+) -> usize {
+    let Some(current_include) = current_include else {
+        return 0;
+    };
+
+    let include_path = resolve_include(&effective.main_file, current_include);
+    if let Some(idx) = themes
+        .iter()
+        .position(|theme| same_path(&theme.path, &include_path))
+    {
+        return idx;
+    }
+
+    if is_theme_wrapper_path(current_include) {
+        let Ok(current_body) = fs::read_to_string(current_theme_artifact) else {
+            return 0;
+        };
+        if let Some(idx) = themes.iter().position(|theme| {
+            fs::read_to_string(&theme.path).ok().as_deref() == Some(current_body.as_str())
+        }) {
+            return idx;
+        }
+    }
+
+    0
+}
+
+pub fn apply_theme_include(_existing: Option<&str>, selected: &Path) -> String {
+    let display = selected.display().to_string();
+    if display.chars().any(char::is_whitespace) {
+        format!("include \"{}\"", display.replace('"', "\\\""))
+    } else {
+        format!("include {}", display)
+    }
+}
+
+fn same_path(left: &Path, right: &Path) -> bool {
+    match (left.canonicalize(), right.canonicalize()) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => left == right,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    use tempfile::tempdir;
+
+    #[test]
+    fn detects_theme_like_paths() {
+        assert!(is_theme_include("themes/gruvbox.conf"));
+        assert!(is_theme_include("~/.config/kitty/colors.conf"));
+        assert!(!is_theme_include("session.conf"));
+    }
+
+    #[test]
+    fn detects_wrapper_theme_paths() {
+        assert!(is_theme_wrapper_path("current-theme.conf"));
+        assert!(is_theme_wrapper_path("/tmp/colors.conf"));
+        assert!(!is_theme_wrapper_path("themes/gruvbox.conf"));
+    }
+
+    #[test]
+    fn prefers_theme_subdirectories_over_config_root() {
+        let dir = tempdir().expect("tempdir");
+        let themes_dir = dir.path().join("themes");
+        fs::create_dir_all(&themes_dir).expect("create themes dir");
+        fs::write(
+            themes_dir.join("gruvbox.conf"),
+            "foreground #ebdbb2\nbackground #282828\n",
+        )
+        .expect("write theme");
+        fs::write(
+            dir.path().join("kitty.conf"),
+            "font_size 13.0\nshell /bin/zsh\n",
+        )
+        .expect("write config");
+        fs::write(
+            dir.path().join("current-theme.conf"),
+            "foreground #ebdbb2\nbackground #282828\n",
+        )
+        .expect("write wrapper");
+
+        let themes = discover_themes(Some(dir.path())).expect("discover themes");
+        let names = themes
+            .into_iter()
+            .map(|theme| theme.name)
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["gruvbox".to_string()]);
+    }
+
+    #[test]
+    fn filters_flat_directories_to_theme_like_files() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(
+            dir.path().join("gruvbox.conf"),
+            "foreground #ebdbb2\nbackground #282828\n",
+        )
+        .expect("write theme");
+        fs::write(
+            dir.path().join("notes.conf"),
+            "font_size 13.0\nshell /bin/zsh\n",
+        )
+        .expect("write non-theme");
+
+        let themes = discover_themes(Some(dir.path())).expect("discover themes");
+        let names = themes
+            .into_iter()
+            .map(|theme| theme.name)
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["gruvbox".to_string()]);
+    }
+
+    #[test]
+    fn finds_current_theme_by_wrapper_contents() {
+        let dir = tempdir().expect("tempdir");
+        let main = dir.path().join("kitty.conf");
+        let wrapper = dir.path().join("current-theme.conf");
+        let theme_dir = dir.path().join("themes");
+        let theme = theme_dir.join("gruvbox.conf");
+        fs::create_dir_all(&theme_dir).expect("create theme dir");
+        fs::write(&main, "include current-theme.conf\n").expect("write main");
+        fs::write(&wrapper, "foreground #ebdbb2\nbackground #282828\n").expect("write wrapper");
+        fs::write(&theme, "foreground #ebdbb2\nbackground #282828\n").expect("write theme");
+
+        let themes = discover_themes(Some(dir.path())).expect("discover themes");
+        let effective = EffectiveConfig {
+            values: Default::default(),
+            keymaps: vec![],
+            includes: vec![],
+            leading_block: String::new(),
+            main_file: main,
+        };
+
+        assert_eq!(
+            find_current_theme_index(&themes, &effective, Some("current-theme.conf"), &wrapper),
+            0
+        );
+    }
+}

@@ -1,0 +1,5 @@
+# Primary custom kitten entrypoint.
+map ctrl+alt+k kitten kitty_config_editor.py
+
+# Direct overlay launch for development.
+map ctrl+alt+shift+k launch --type=overlay-main kitty-config-editor --runtime=kitty
