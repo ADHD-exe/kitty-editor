@@ -27,10 +27,10 @@ pub fn render(frame: &mut Frame, app: &AppConfig) {
         Mode::Themes => render_themes_mode(frame, body, app),
         Mode::Keybindings => render_keybindings_mode(frame, body, app),
         Mode::Help => {
-            render_browse(frame, body, app);
+            render_primary_browser(frame, body, app);
             render_help_popup(frame, body);
         }
-        _ => render_browse(frame, body, app),
+        _ => render_primary_browser(frame, body, app),
     }
     render_footer(frame, footer, app);
     if matches!(
@@ -38,6 +38,14 @@ pub fn render(frame: &mut Frame, app: &AppConfig) {
         Mode::Search | Mode::Edit | Mode::Confirm | Mode::EnumPicker
     ) {
         render_input_popup(frame, root, app);
+    }
+}
+
+fn render_primary_browser(frame: &mut Frame, area: Rect, app: &AppConfig) {
+    if app.live_theme_edit {
+        render_theme_edit_mode(frame, area, app);
+    } else {
+        render_browse(frame, area, app);
     }
 }
 
@@ -109,6 +117,47 @@ fn render_browse(frame: &mut Frame, area: Rect, app: &AppConfig) {
 
     let details = render_details(app);
     frame.render_widget(details, cols[2]);
+}
+
+fn render_theme_edit_mode(frame: &mut Frame, area: Rect, app: &AppConfig) {
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(44), Constraint::Min(30)])
+        .split(area);
+
+    let setting_items: Vec<ListItem> = app
+        .search_results
+        .iter()
+        .enumerate()
+        .filter_map(|(visible_idx, idx)| {
+            let meta = app.metadata.get(*idx)?;
+            let value = app.current_value_for(&meta.key);
+            let validation = value
+                .as_deref()
+                .map(|v| validate(meta, v))
+                .unwrap_or(ValidationState::Unknown);
+            let line = render_setting_line(
+                meta,
+                value.as_deref(),
+                app.is_changed(&meta.key),
+                &validation,
+            );
+            let style = if visible_idx == app.selected_setting && app.focus == Focus::Settings {
+                Style::default().bg(Color::Blue)
+            } else {
+                Style::default()
+            };
+            Some(ListItem::new(line).style(style))
+        })
+        .collect();
+    let title = format!("Theme Colors ({})", app.search_results.len());
+    let settings =
+        List::new(setting_items).block(Block::default().title(title).borders(Borders::ALL));
+    let mut settings_state = list_state(app.selected_setting, app.search_results.len());
+    frame.render_stateful_widget(settings, cols[0], &mut settings_state);
+
+    let details = render_details(app);
+    frame.render_widget(details, cols[1]);
 }
 
 fn render_details(app: &AppConfig) -> Paragraph<'static> {
@@ -222,7 +271,7 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &AppConfig) {
         .constraints([Constraint::Length(28), Constraint::Min(32)])
         .split(area);
     let mode_box = Paragraph::new(Text::from(vec![
-        Line::raw(format!("Mode: {:?}", app.mode)),
+        Line::raw(format!("Mode: {}", session_mode_label(app))),
         Line::raw(format!("Status: {}", app.status)),
     ]))
     .block(Block::default().title("Session").borders(Borders::ALL))
@@ -235,6 +284,24 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &AppConfig) {
         .wrap(Wrap { trim: true })
         .style(Style::default().fg(Color::White).bg(Color::DarkGray));
     frame.render_widget(keys_box, cols[1]);
+}
+
+fn session_mode_label(app: &AppConfig) -> &'static str {
+    if app.live_theme_edit {
+        "ThemeEdit"
+    } else {
+        match app.mode {
+            Mode::Browse => "Browse",
+            Mode::Search => "Search",
+            Mode::Edit => "Edit",
+            Mode::EnumPicker => "EnumPicker",
+            Mode::Diff => "Diff",
+            Mode::Themes => "Themes",
+            Mode::Keybindings => "Keybindings",
+            Mode::Confirm => "Confirm",
+            Mode::Help => "Help",
+        }
+    }
 }
 
 fn render_input_popup(frame: &mut Frame, area: Rect, app: &AppConfig) {
@@ -379,7 +446,7 @@ fn render_themes_mode(frame: &mut Frame, area: Rect, app: &AppConfig) {
                     Line::raw(""),
                     Line::raw("Up/Down preview without saving"),
                     Line::raw("Enter selects a theme"),
-                    Line::raw("e enters live color editing"),
+                    Line::raw("e opens the editable theme color list"),
                     Line::raw("w saves the current editable theme as a preset"),
                     Line::raw(""),
                 ];
@@ -542,7 +609,7 @@ fn render_keybindings_mode(frame: &mut Frame, area: Rect, app: &AppConfig) {
 fn render_help_popup(frame: &mut Frame, area: Rect) {
     let popup = centered_rect(70, 70, area);
     frame.render_widget(Clear, popup);
-    let text = "Browse/Search/Edit/Diff/Themes/Keybindings\n\nUp/Down navigate\nLeft/Right or Tab change focus in settings view\nEnter select theme or confirm edit\ne edit current setting / enter live theme edit\nIn keybindings: Enter/e reassign shortcut, / filter, j/k or arrows move, PgUp/PgDn scroll\nd diff\nr reset to default\nc clear override\ns save and live reload\nS minimal save and live reload\nt themes\nw save current editable theme as new preset\nk keybindings\n1/2/3 shortcut views\nR save and force reload\nq quit\nEsc cancel";
+    let text = "Browse/Search/Edit/Diff/Themes/Keybindings\n\nUp/Down navigate\nLeft/Right or Tab change focus\nEnter select theme or confirm edit\ne edit current setting / start theme editing\nd diff\nr reset to default\nc clear override\ns save and live reload\nS minimal save and live reload\nt themes\nw save the current theme as a preset\nk keybindings\n1/2/3 shortcut views\nR save and force reload\nq quit\nEsc cancel";
     frame.render_widget(
         Paragraph::new(text)
             .block(Block::default().title("Help").borders(Borders::ALL))
@@ -554,7 +621,7 @@ fn render_help_popup(frame: &mut Frame, area: Rect) {
 fn footer_keys(app: &AppConfig) -> Text<'static> {
     let text = match app.mode {
         Mode::Themes => {
-            "Up/Down preview  / filter  Enter select  e live edit  w save preset  s save  S minimal save  Esc back  q quit"
+            "Up/Down preview  / filter  Enter select  e edit theme  w save preset  s save  S minimal save  Esc back  q quit"
         }
         Mode::Keybindings => {
             "Up/Down/j/k move  PgUp/PgDn scroll  Enter/e reassign  / filter  1/2/3 views  a add  x delete/unmap  Esc back  q quit"
@@ -563,6 +630,9 @@ fn footer_keys(app: &AppConfig) -> Text<'static> {
         Mode::Search => "Type to filter  Enter apply search  Esc cancel",
         Mode::Edit => "Type value  Enter save edit  Esc cancel",
         Mode::EnumPicker => "Up/Down choose  Enter apply  Esc cancel",
+        _ if app.live_theme_edit => {
+            "Up/Down move  Enter/e edit value  / filter  r reset  c clear  w save preset  Tab focus details  Esc finish  q quit"
+        }
         _ => {
             "/ search  Enter/e edit  Left/Right/Tab panes  Up/Down move  d diff  t themes  k keymaps  r reset  c clear  s save  S minimal  R reload  q quit"
         }

@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -102,6 +102,8 @@ pub fn build_app(
         theme_edit_save_path: None,
         theme_preview_active: false,
         live_theme_edit: false,
+        theme_edit_keys: vec![],
+        theme_edit_dirty: false,
     };
     sync_visible_settings(&mut app);
     app
@@ -175,10 +177,14 @@ fn handle_key(app: &mut AppConfig, opts: &RuntimeOptions, key: KeyEvent) -> Resu
         }
         KeyCode::Char('?') => app.mode = Mode::Help,
         KeyCode::Esc => {
-            if app.mode == Mode::Themes {
+            if app.live_theme_edit && app.mode == Mode::Browse {
+                finish_theme_edit_session(app)?;
+            } else if app.mode == Mode::Themes {
                 restore_theme_preview(app, opts)?;
+                app.mode = Mode::Browse;
+            } else {
+                app.mode = Mode::Browse;
             }
-            app.mode = Mode::Browse;
         }
         KeyCode::Tab => cycle_focus(app),
         KeyCode::Left if app.mode == Mode::Browse => move_focus_left(app),
@@ -214,7 +220,13 @@ fn handle_key(app: &mut AppConfig, opts: &RuntimeOptions, key: KeyEvent) -> Resu
             app.edit_target = None;
         }
         KeyCode::Char('d') => open_diff(app),
-        KeyCode::Char('t') => open_theme_browser(app),
+        KeyCode::Char('t') => {
+            if app.live_theme_edit && app.mode == Mode::Browse {
+                finish_theme_edit_session(app)?;
+            } else {
+                open_theme_browser(app);
+            }
+        }
         KeyCode::Char('k') => open_keybindings(app),
         KeyCode::Char('r') => {
             reset_current_to_default(app);
@@ -235,6 +247,11 @@ fn handle_key(app: &mut AppConfig, opts: &RuntimeOptions, key: KeyEvent) -> Resu
         KeyCode::Char('R') => {
             prepare_theme_selection_for_save(app)?;
             save_current(app, opts, SaveMode::Full, true)?;
+        }
+        KeyCode::Char('w') if app.live_theme_edit && app.mode == Mode::Browse => {
+            app.live_theme_edit = false;
+            app.theme_edit_dirty = false;
+            begin_theme_save_as(app)?
         }
         KeyCode::Char('w') | KeyCode::Char('n') if app.mode == Mode::Themes => {
             begin_theme_save_as(app)?
@@ -467,6 +484,9 @@ fn commit_edit(app: &mut AppConfig) -> Result<()> {
                     .insert(meta.key.clone(), app.edit_buffer.clone());
                 app.status = format!("updated {}", meta.key);
                 if is_theme_setting_key(&meta.key) {
+                    if app.live_theme_edit {
+                        app.theme_edit_dirty = true;
+                    }
                     maybe_preview_live_theme_edit(app)?;
                 }
                 app.mode = Mode::Browse;
@@ -572,6 +592,14 @@ fn refresh_search(app: &mut AppConfig) {
 }
 
 fn cycle_focus(app: &mut AppConfig) {
+    if app.live_theme_edit {
+        app.focus = if app.focus == Focus::Details {
+            Focus::Settings
+        } else {
+            Focus::Details
+        };
+        return;
+    }
     app.focus = match app.focus {
         Focus::Categories => Focus::Settings,
         Focus::Settings => Focus::Details,
@@ -580,6 +608,10 @@ fn cycle_focus(app: &mut AppConfig) {
 }
 
 fn move_focus_left(app: &mut AppConfig) {
+    if app.live_theme_edit {
+        app.focus = Focus::Settings;
+        return;
+    }
     app.focus = match app.focus {
         Focus::Categories => Focus::Categories,
         Focus::Settings => Focus::Categories,
@@ -588,6 +620,10 @@ fn move_focus_left(app: &mut AppConfig) {
 }
 
 fn move_focus_right(app: &mut AppConfig) {
+    if app.live_theme_edit {
+        app.focus = Focus::Details;
+        return;
+    }
     app.focus = match app.focus {
         Focus::Categories => Focus::Settings,
         Focus::Settings => Focus::Details,
@@ -738,6 +774,9 @@ fn reset_current_to_default(app: &mut AppConfig) {
     if let Some(meta) = app.current_setting().cloned() {
         if let Some(default) = meta.default_value {
             app.edited_values.insert(meta.key.clone(), default);
+            if app.live_theme_edit && is_theme_setting_key(&meta.key) {
+                app.theme_edit_dirty = true;
+            }
             app.status = format!("reset {} to default", meta.key);
         }
     }
@@ -746,6 +785,9 @@ fn reset_current_to_default(app: &mut AppConfig) {
 fn clear_current(app: &mut AppConfig) {
     if let Some(meta) = app.current_setting().cloned() {
         app.edited_values.insert(meta.key.clone(), String::new());
+        if app.live_theme_edit && is_theme_setting_key(&meta.key) {
+            app.theme_edit_dirty = true;
+        }
         app.status = format!("cleared {}", meta.key);
     }
 }
@@ -865,13 +907,15 @@ fn apply_selected_theme(app: &mut AppConfig) -> Result<()> {
         &include_line,
     );
     app.current_theme_include = Some(wrapper_include.into());
-    app.status = format!("theme selected: {} | press e to edit live", theme_name);
+    app.theme_edit_dirty = false;
+    app.status = format!("theme selected: {} | press e to edit colors", theme_name);
     Ok(())
 }
 
 fn open_theme_browser(app: &mut AppConfig) {
     app.mode = Mode::Themes;
     app.live_theme_edit = false;
+    app.theme_edit_dirty = false;
     app.selected_theme = find_current_theme_index(
         &app.themes,
         &app.effective,
@@ -886,7 +930,7 @@ fn open_theme_browser(app: &mut AppConfig) {
         "no themes match the current filter".into()
     } else {
         format!(
-            "theme browser: {} | / filter, Up/Down preview, Enter select, e edit live",
+            "theme browser: {} | / filter, Up/Down preview, Enter select, e edit theme",
             app.themes[app.selected_theme].name
         )
     };
@@ -923,6 +967,7 @@ fn preview_selected_theme(app: &mut AppConfig, _opts: &RuntimeOptions) -> Result
     let preview_status = preview_theme(&theme.path)?;
     app.theme_preview_active = true;
     app.live_theme_edit = false;
+    app.theme_edit_dirty = false;
     app.status = format!("{} | {}", theme.name, preview_status);
     Ok(())
 }
@@ -934,11 +979,13 @@ fn restore_theme_preview(app: &mut AppConfig, opts: &RuntimeOptions) -> Result<(
     let restore_status = reload_config(opts.reload_command.as_deref(), &app.effective.main_file)?;
     app.theme_preview_active = false;
     app.live_theme_edit = false;
+    app.theme_edit_dirty = false;
     app.status = format!("theme preview cleared | {}", restore_status);
     Ok(())
 }
 
 fn stage_theme_values_from_file(app: &mut AppConfig, path: &Path) -> Result<()> {
+    app.theme_edit_keys = theme_setting_key_order(path)?;
     for key in app
         .metadata
         .iter()
@@ -986,6 +1033,8 @@ fn refresh_effective_state(app: &mut AppConfig) -> Result<()> {
     app.pending_theme_path = None;
     app.theme_preview_active = false;
     app.live_theme_edit = false;
+    app.theme_edit_keys.clear();
+    app.theme_edit_dirty = false;
     app.effective = effective;
     sync_visible_settings(app);
     Ok(())
@@ -998,11 +1047,15 @@ fn begin_theme_live_edit(app: &mut AppConfig) -> Result<()> {
         .map(|theme| theme.name.clone())
         .unwrap_or_else(|| "theme".into());
     apply_selected_theme(app)?;
+    app.live_theme_edit = true;
+    app.theme_edit_dirty = false;
     focus_theme_editor(app);
     let preview_status = preview_current_theme_values(app)?;
-    app.live_theme_edit = true;
     app.mode = Mode::Browse;
-    app.status = format!("editing theme live: {} | {}", theme_name, preview_status);
+    app.status = format!(
+        "editing theme: {} | Esc finishes and asks to save | {}",
+        theme_name, preview_status
+    );
     Ok(())
 }
 
@@ -1029,24 +1082,8 @@ fn maybe_preview_live_theme_edit(app: &mut AppConfig) -> Result<()> {
 
 fn focus_theme_editor(app: &mut AppConfig) {
     app.search_query.clear();
-    if let Some(target_idx) = preferred_theme_setting_index(app) {
-        if let Some(category_idx) = app.metadata.get(target_idx).and_then(|meta| {
-            app.categories
-                .iter()
-                .position(|category| category == &meta.category)
-        }) {
-            app.selected_category = category_idx;
-        }
-        sync_visible_settings(app);
-        app.selected_setting = app
-            .search_results
-            .iter()
-            .position(|idx| *idx == target_idx)
-            .unwrap_or(0);
-    } else {
-        sync_visible_settings(app);
-        app.selected_setting = 0;
-    }
+    sync_visible_settings(app);
+    app.selected_setting = 0;
     app.focus = Focus::Settings;
     app.detail_scroll = 0;
 }
@@ -1096,7 +1133,13 @@ fn save_theme_as(app: &mut AppConfig) -> Result<()> {
     }
     app.pending_theme_path = Some(save_path.clone());
     app.theme_edit_save_path = Some(save_path.clone());
-    app.status = format!("saved theme {} | press e to edit live", save_path.display());
+    app.live_theme_edit = false;
+    app.theme_edit_dirty = false;
+    app.theme_edit_keys = theme_setting_key_order(&save_path)?;
+    app.status = format!(
+        "saved theme {} | press e to edit colors",
+        save_path.display()
+    );
     app.mode = Mode::Themes;
     app.edit_target = None;
     Ok(())
@@ -1185,6 +1228,21 @@ fn select_shortcut_by_edited_index(app: &mut AppConfig, edited_index: usize) {
     }
 }
 
+fn finish_theme_edit_session(app: &mut AppConfig) -> Result<()> {
+    if app.theme_edit_dirty && app.theme_edit_save_path.is_none() {
+        app.live_theme_edit = false;
+        app.theme_edit_dirty = false;
+        begin_theme_save_as(app)?;
+        app.status = "save edited theme as a new preset".into();
+    } else {
+        app.live_theme_edit = false;
+        app.theme_edit_dirty = false;
+        app.search_query.clear();
+        open_theme_browser(app);
+    }
+    Ok(())
+}
+
 fn maybe_auto_save_live_theme(app: &mut AppConfig) -> Result<Option<PathBuf>> {
     if !app.live_theme_edit {
         return Ok(None);
@@ -1203,23 +1261,23 @@ fn maybe_auto_save_live_theme(app: &mut AppConfig) -> Result<Option<PathBuf>> {
     Ok(Some(path))
 }
 
-fn preferred_theme_setting_index(app: &AppConfig) -> Option<usize> {
-    const PREFERRED_KEYS: [&str; 5] = [
-        "foreground",
-        "background",
-        "cursor",
-        "selection_foreground",
-        "selection_background",
-    ];
-
-    PREFERRED_KEYS
-        .iter()
-        .find_map(|key| app.metadata.iter().position(|meta| meta.key == *key))
-        .or_else(|| {
-            app.metadata
-                .iter()
-                .position(|meta| is_theme_setting_key(&meta.key))
-        })
+fn theme_setting_key_order(path: &Path) -> Result<Vec<String>> {
+    let text = std::fs::read_to_string(path)?;
+    let mut keys = Vec::new();
+    let mut seen = HashSet::new();
+    for raw in text.lines() {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let Some(key) = trimmed.split_whitespace().next() else {
+            continue;
+        };
+        if is_theme_setting_key(key) && seen.insert(key.to_string()) {
+            keys.push(key.to_string());
+        }
+    }
+    Ok(keys)
 }
 
 fn same_path(left: &Path, right: &Path) -> bool {
@@ -1230,6 +1288,11 @@ fn same_path(left: &Path, right: &Path) -> bool {
 }
 
 fn sync_visible_settings(app: &mut AppConfig) {
+    if app.live_theme_edit {
+        sync_theme_edit_settings(app);
+        return;
+    }
+
     if !app.search_query.trim().is_empty() {
         app.search_results = fuzzy_search::search(&app.metadata, &app.search_query);
         return;
@@ -1245,6 +1308,44 @@ fn sync_visible_settings(app: &mut AppConfig) {
     } else {
         app.search_results = (0..app.metadata.len()).collect();
     }
+}
+
+fn sync_theme_edit_settings(app: &mut AppConfig) {
+    if !app.search_query.trim().is_empty() {
+        app.search_results = fuzzy_search::search(&app.metadata, &app.search_query)
+            .into_iter()
+            .filter(|idx| {
+                app.metadata
+                    .get(*idx)
+                    .is_some_and(|meta| is_theme_setting_key(&meta.key))
+            })
+            .collect();
+        return;
+    }
+
+    let mut ordered = Vec::new();
+    let mut seen = HashSet::new();
+
+    for key in &app.theme_edit_keys {
+        if let Some((idx, _)) = app
+            .metadata
+            .iter()
+            .enumerate()
+            .find(|(_, meta)| meta.key == *key && is_theme_setting_key(&meta.key))
+        {
+            if seen.insert(idx) {
+                ordered.push(idx);
+            }
+        }
+    }
+
+    for (idx, meta) in app.metadata.iter().enumerate() {
+        if is_theme_setting_key(&meta.key) && seen.insert(idx) {
+            ordered.push(idx);
+        }
+    }
+
+    app.search_results = ordered;
 }
 
 #[cfg(test)]
@@ -1318,6 +1419,8 @@ mod tests {
             theme_edit_save_path: None,
             theme_preview_active: false,
             live_theme_edit: false,
+            theme_edit_keys: vec![],
+            theme_edit_dirty: false,
         }
     }
 
@@ -1414,7 +1517,7 @@ mod tests {
     }
 
     #[test]
-    fn focus_theme_editor_selects_colors_category() {
+    fn focus_theme_editor_clears_search_and_selects_first_theme_key() {
         let font_meta = SettingMetadata {
             key: "font_size".into(),
             category: "Fonts".into(),
@@ -1486,14 +1589,16 @@ mod tests {
             pending_theme_path: None,
             theme_edit_save_path: None,
             theme_preview_active: false,
-            live_theme_edit: false,
+            live_theme_edit: true,
+            theme_edit_keys: vec!["foreground".into()],
+            theme_edit_dirty: false,
         };
 
         focus_theme_editor(&mut app);
 
         assert_eq!(app.focus, Focus::Settings);
         assert!(app.search_query.is_empty());
-        assert_eq!(app.selected_category, 1);
+        assert_eq!(app.search_results, vec![1]);
         assert_eq!(
             app.current_setting().map(|meta| meta.key.as_str()),
             Some("foreground")
@@ -1501,7 +1606,7 @@ mod tests {
     }
 
     #[test]
-    fn focus_theme_editor_prefers_primary_theme_colors_over_tab_colors() {
+    fn focus_theme_editor_keeps_theme_file_keys_first_then_rest() {
         let tab_meta = SettingMetadata {
             key: "active_tab_foreground".into(),
             category: "Tab bar".into(),
@@ -1573,12 +1678,14 @@ mod tests {
             pending_theme_path: None,
             theme_edit_save_path: None,
             theme_preview_active: false,
-            live_theme_edit: false,
+            live_theme_edit: true,
+            theme_edit_keys: vec!["foreground".into()],
+            theme_edit_dirty: false,
         };
 
         focus_theme_editor(&mut app);
 
-        assert_eq!(app.selected_category, 1);
+        assert_eq!(app.search_results, vec![1, 0]);
         assert_eq!(
             app.current_setting().map(|meta| meta.key.as_str()),
             Some("foreground")
@@ -1715,12 +1822,170 @@ mod tests {
             theme_edit_save_path: Some(save_path.clone()),
             theme_preview_active: false,
             live_theme_edit: true,
+            theme_edit_keys: vec!["foreground".into()],
+            theme_edit_dirty: false,
         };
 
         maybe_preview_live_theme_edit(&mut app).expect("preview live edit");
 
         let body = fs::read_to_string(save_path).expect("read saved theme");
         assert!(body.contains("foreground #ffffff"));
+    }
+
+    #[test]
+    fn stage_theme_values_from_file_keeps_file_order_first() {
+        let dir = tempdir().expect("tempdir");
+        let theme_path = dir.path().join("ordered.conf");
+        fs::write(
+            &theme_path,
+            "background #000000\nforeground #ffffff\ncursor #ff00ff\n",
+        )
+        .expect("write theme");
+
+        let foreground = SettingMetadata {
+            key: "foreground".into(),
+            category: "Colors".into(),
+            description: String::new(),
+            default_value: Some("#ebdbb2".into()),
+            examples: vec![],
+            enum_choices: vec![],
+            repeatable: false,
+            value_type: ValueType::Color,
+            order: 0,
+        };
+        let background = SettingMetadata {
+            key: "background".into(),
+            category: "Colors".into(),
+            description: String::new(),
+            default_value: Some("#282828".into()),
+            examples: vec![],
+            enum_choices: vec![],
+            repeatable: false,
+            value_type: ValueType::Color,
+            order: 1,
+        };
+        let cursor = SettingMetadata {
+            key: "cursor".into(),
+            category: "Colors".into(),
+            description: String::new(),
+            default_value: Some("#d0d0d0".into()),
+            examples: vec![],
+            enum_choices: vec![],
+            repeatable: false,
+            value_type: ValueType::Color,
+            order: 2,
+        };
+        let selection = SettingMetadata {
+            key: "selection_background".into(),
+            category: "Colors".into(),
+            description: String::new(),
+            default_value: Some("#444444".into()),
+            examples: vec![],
+            enum_choices: vec![],
+            repeatable: false,
+            value_type: ValueType::Color,
+            order: 3,
+        };
+        let mut app = AppConfig {
+            metadata: vec![
+                foreground.clone(),
+                background.clone(),
+                cursor.clone(),
+                selection.clone(),
+            ],
+            metadata_by_key: HashMap::from([
+                (foreground.key.clone(), foreground),
+                (background.key.clone(), background),
+                (cursor.key.clone(), cursor),
+                (selection.key.clone(), selection),
+            ]),
+            effective: EffectiveConfig {
+                values: HashMap::new(),
+                keymaps: vec![],
+                includes: vec![],
+                leading_block: String::new(),
+                main_file: PathBuf::from("kitty.conf"),
+            },
+            default_keymaps: vec![],
+            edited_values: HashMap::new(),
+            edited_keymaps: vec![],
+            selected_category: 0,
+            selected_setting: 0,
+            categories: vec!["Colors".into()],
+            search_query: String::new(),
+            search_target: SearchTarget::Settings,
+            search_results: vec![],
+            theme_query: String::new(),
+            mode: Mode::Browse,
+            focus: Focus::Settings,
+            edit_buffer: String::new(),
+            edit_target: None,
+            enum_index: 0,
+            keymap_field: KeymapField::Shortcut,
+            detail_scroll: 0,
+            diff_scroll: 0,
+            status: String::new(),
+            diff_lines: vec![],
+            themes: vec![],
+            themes_dir: None,
+            current_theme_artifact: PathBuf::from("current-theme.conf"),
+            selected_theme: 0,
+            shortcut_view: ShortcutView::Custom,
+            shortcut_query: String::new(),
+            selected_shortcut: 0,
+            pending_quit: false,
+            current_theme_include: None,
+            pending_theme_path: None,
+            theme_edit_save_path: None,
+            theme_preview_active: false,
+            live_theme_edit: true,
+            theme_edit_keys: vec![],
+            theme_edit_dirty: false,
+        };
+
+        stage_theme_values_from_file(&mut app, &theme_path).expect("stage theme values");
+        sync_visible_settings(&mut app);
+
+        assert_eq!(
+            app.search_results,
+            vec![1, 0, 2, 3],
+            "theme file keys should stay first, then remaining theme settings"
+        );
+        assert_eq!(
+            app.current_value_for("background").as_deref(),
+            Some("#000000")
+        );
+        assert_eq!(
+            app.current_value_for("foreground").as_deref(),
+            Some("#ffffff")
+        );
+    }
+
+    #[test]
+    fn finish_theme_edit_session_prompts_save_as_for_unsaved_changes() {
+        let dir = tempdir().expect("tempdir");
+        let themes_dir = dir.path().join("themes");
+        fs::create_dir_all(&themes_dir).expect("create themes dir");
+        let theme_path = themes_dir.join("gruvbox.conf");
+        fs::write(&theme_path, "foreground #ffffff\n").expect("write theme");
+
+        let mut app = app_for_diff();
+        app.themes_dir = Some(themes_dir);
+        app.themes = vec![ThemeEntry {
+            name: "gruvbox".into(),
+            path: theme_path.clone(),
+            preview: vec![],
+        }];
+        app.pending_theme_path = Some(theme_path);
+        app.live_theme_edit = true;
+        app.theme_edit_dirty = true;
+
+        finish_theme_edit_session(&mut app).expect("finish theme edit");
+
+        assert_eq!(app.mode, Mode::Edit);
+        assert_eq!(app.edit_target, Some(EditTarget::ThemeSaveAs));
+        assert_eq!(app.edit_buffer, "gruvbox");
+        assert!(!app.live_theme_edit);
     }
 
     #[test]

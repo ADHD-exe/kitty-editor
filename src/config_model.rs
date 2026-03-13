@@ -216,6 +216,8 @@ pub struct AppConfig {
     pub theme_edit_save_path: Option<PathBuf>,
     pub theme_preview_active: bool,
     pub live_theme_edit: bool,
+    pub theme_edit_keys: Vec<String>,
+    pub theme_edit_dirty: bool,
 }
 
 impl AppConfig {
