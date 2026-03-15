@@ -20,7 +20,7 @@ use crate::reload::{preview_theme, preview_theme_artifact, reload_config};
 use crate::runtime::TerminalSession;
 use crate::theme_browser::{
     apply_theme_include, detect_current_theme_include, discover_themes, find_current_theme_index,
-    is_theme_setting_key, theme_artifact_path,
+    is_theme_setting_key, selected_theme_wrapper_include, theme_artifact_path,
 };
 use crate::ui_renderer;
 use crate::validator::validate;
@@ -896,17 +896,20 @@ fn apply_selected_theme(app: &mut AppConfig) -> Result<()> {
     }
     stage_theme_values_from_file(app, &theme_path)?;
     app.pending_theme_path = Some(theme_path);
-    let wrapper_include = "current-theme.conf";
+    let wrapper_include = selected_theme_wrapper_include(
+        &app.effective.main_file,
+        app.current_theme_include.as_deref(),
+    );
     let include_line = apply_theme_include(
         app.current_theme_include.as_deref(),
-        Path::new(wrapper_include),
+        Path::new(&wrapper_include),
     );
     app.effective.leading_block = replace_or_insert_theme_include_in_text(
         &app.effective.leading_block,
         app.current_theme_include.as_deref(),
         &include_line,
     );
-    app.current_theme_include = Some(wrapper_include.into());
+    app.current_theme_include = Some(wrapper_include);
     app.theme_edit_dirty = false;
     app.status = format!("theme selected: {} | press e to edit colors", theme_name);
     Ok(())
@@ -2096,5 +2099,41 @@ mod tests {
         apply_selected_theme(&mut app).expect("apply theme");
 
         assert!(app.theme_edit_save_path.is_none());
+    }
+
+    #[test]
+    fn applying_theme_avoids_reusing_unmanaged_legacy_wrapper_name() {
+        let dir = tempdir().expect("tempdir");
+        let main_path = dir.path().join("kitty.conf");
+        let legacy_path = dir.path().join("current-theme.conf");
+        let theme_path = dir.path().join("themes").join("rabbit.conf");
+        fs::create_dir_all(theme_path.parent().expect("theme dir")).expect("create theme dir");
+        fs::write(&main_path, "include current-theme.conf\n").expect("write main");
+        fs::write(&legacy_path, "foreground #ebdbb2\nbackground #282828\n")
+            .expect("write legacy theme");
+        fs::write(&theme_path, "foreground #ffffff\nbackground #000000\n")
+            .expect("write selected theme");
+
+        let mut app = app_for_diff();
+        app.effective.main_file = main_path;
+        app.effective.leading_block = "include current-theme.conf\n".into();
+        app.current_theme_include = Some("current-theme.conf".into());
+        app.themes = vec![ThemeEntry {
+            name: "rabbit".into(),
+            path: theme_path,
+            preview: vec![],
+        }];
+        app.selected_theme = 0;
+
+        apply_selected_theme(&mut app).expect("apply theme");
+
+        assert_eq!(
+            app.current_theme_include.as_deref(),
+            Some("kitty-config-editor-theme.conf")
+        );
+        assert!(app
+            .effective
+            .leading_block
+            .contains("include kitty-config-editor-theme.conf"));
     }
 }
