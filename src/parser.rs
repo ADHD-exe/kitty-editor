@@ -451,7 +451,9 @@ pub fn resolve_include(base_file: &Path, include_path: &str) -> PathBuf {
 }
 
 fn parse_include_target(include_path: &str) -> &str {
-    include_path.trim().trim_matches('"')
+    include_path
+        .trim()
+        .trim_matches(|ch| ch == '"' || ch == '\'')
 }
 
 fn parse_map_entry(
@@ -627,6 +629,15 @@ mod tests {
         let resolved = resolve_include(
             Path::new("/tmp/kitty/kitty.conf"),
             "\"themes/gruvbox.conf\"",
+        );
+        assert_eq!(resolved, PathBuf::from("/tmp/kitty/themes/gruvbox.conf"));
+    }
+
+    #[test]
+    fn resolves_single_quoted_include_paths() {
+        let resolved = resolve_include(
+            Path::new("/tmp/kitty/kitty.conf"),
+            "'themes/gruvbox.conf'",
         );
         assert_eq!(resolved, PathBuf::from("/tmp/kitty/themes/gruvbox.conf"));
     }
